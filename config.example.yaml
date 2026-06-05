@@ -1,0 +1,29 @@
+# fortigate-netbox-sync — Configuration file
+# Copy this file to config.yaml and fill in your values.
+# NEVER commit config.yaml to a public repository (contains sensitive tokens).
+
+fortigate:
+  host: 10.0.0.1                   # FortiGate IP or FQDN (active node in HA)
+  token: YOUR_FORTIGATE_API_TOKEN   # REST API token (System > Administrators > REST API Admin)
+  validate_ssl: false               # Set to true if your FortiGate has a CA-signed certificate
+
+netbox:
+  host: https://netbox.example.com  # Full URL of your NetBox instance
+  token: YOUR_NETBOX_API_TOKEN       # NetBox API token (read + write)
+  validate_ssl: false                # Set to true if NetBox has a trusted CA-signed certificate
+  site: YOUR_SITE                        # Exact site name in NetBox (case-sensitive)
+
+  # Optional: override the device name in NetBox.
+  # Defaults to the FortiGate model name (e.g. "FortiGate-100F").
+  # device_name: FW-NIMES-01
+
+options:
+  dry_run: false                    # true = simulate without writing to NetBox (same as --dry-run)
+
+  # Subnets allowed for IP import.
+  # Any IP outside these ranges will be skipped.
+  # Leave empty to import all IPs (not recommended).
+  permitted_subnets:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    # - 192.168.0.0/16   # Example of a specific subnet

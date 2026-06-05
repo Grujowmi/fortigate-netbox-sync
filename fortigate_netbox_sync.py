@@ -10,12 +10,15 @@ Objects created/updated:
   - VLAN interfaces      -> dcim.interfaces + ipam.vlans
   - IP addresses         -> ipam.ip_addresses
   - Prefixes             -> ipam.prefixes
+  - IPsec tunnels        -> vpn.tunnels + vpn.tunnel_terminations
+  - SSL-VPN tunnel       -> vpn.tunnels
+  - SSL-VPN IP pools     -> ipam.ip_ranges
 
 Usage:
   python3 fortigate_netbox_sync.py --config config.yaml
   python3 fortigate_netbox_sync.py --config config.yaml --dry-run
 
-Author : Grujowmi — released under MIT license
+Author : ONCOGARD / Pierre — released under MIT license
 Repo   : https://github.com/Grujowmi/fortigate-netbox-sync
 """
 
@@ -96,13 +99,28 @@ def is_permitted(ip_str: str, permitted: list[str]) -> bool:
         return False
 
 
-def cidr_from_fortigate(ip: str, mask: str) -> Optional[str]:
+def cidr_from_fortigate(ip: str, mask: str = "") -> Optional[str]:
     """
-    Convert a FortiGate ip + netmask pair (e.g. "172.17.1.254", "255.255.255.0")
-    to CIDR notation (e.g. "172.17.1.254/24").
+    Convert a FortiGate IP field to CIDR notation.
+
+    Handles two formats:
+      - Combined : ip="172.17.1.254 255.255.255.0", mask=""  (FortiOS 7.x)
+      - Separate : ip="172.17.1.254", mask="255.255.255.0"   (older firmware)
+
     Returns None if invalid or 0.0.0.0.
     """
+    if not ip:
+        return None
+    # Combined format: "x.x.x.x y.y.y.y"
+    if " " in ip:
+        parts = ip.split()
+        if len(parts) == 2:
+            ip, mask = parts[0], parts[1]
+        else:
+            return None
     if not ip or ip == "0.0.0.0":
+        return None
+    if not mask or mask == "0.0.0.0":
         return None
     try:
         prefix_len = ipaddress.IPv4Network(f"0.0.0.0/{mask}", strict=False).prefixlen
@@ -167,6 +185,25 @@ class FortiGateClient:
         """Return only physical/aggregate/redundant interfaces."""
         return [i for i in self.get_interfaces()
                 if i.get("type") in ("physical", "aggregate", "redundant")]
+
+    def get_ipsec_tunnels(self) -> list:
+        """Return all IPsec phase1 tunnel definitions."""
+        return self._get("cmdb/vpn.ipsec/phase1-interface")
+
+    def get_ssl_vpn_settings(self) -> dict:
+        """Return SSL-VPN global settings."""
+        raw = self._get("cmdb/vpn.ssl/settings")
+        # _get returns results value; for ssl settings it's a dict not a list
+        return raw if isinstance(raw, dict) else {}
+
+    def get_ip_pools(self) -> list:
+        """Return firewall address objects of type iprange.
+
+        SSL-VPN tunnel pools (e.g. SSLVPN_TUNNEL_ADDR1) are stored as
+        firewall/address with type=iprange, not in firewall/ippool.
+        """
+        all_addr = self._get("cmdb/firewall/address")
+        return [a for a in all_addr if a.get("type") == "iprange"]
 
 
 # ---------------------------------------------------------------------------
@@ -515,9 +552,10 @@ class NetBoxSync:
                     log.debug(f"  ~ VLAN interface updated: {name}")
 
             # --- IP address on the VLAN interface ---
+            # FortiOS 7.x returns "x.x.x.x y.y.y.y" in a single "ip" field
             ip_str   = vlan.get("ip", "")
-            mask_str = vlan.get("netmask", "")
-            if ip_str and mask_str:
+            mask_str = vlan.get("netmask", "")  # may be empty on newer firmware
+            if ip_str:
                 self._sync_ip(ip_str, mask_str, nb_iface, nb_vlan, site)
 
     # ------------------------------------------------------------------
@@ -536,7 +574,15 @@ class NetBoxSync:
         network = network_from_cidr(cidr)
 
         # Prefix
-        prefix = self.nb.ipam.prefixes.get(prefix=network, site_id=site.id) if not self.dry_run else None
+        # Search by prefix value only (site-aware search can miss global-table duplicates)
+        prefix = None
+        if not self.dry_run:
+            results = list(self.nb.ipam.prefixes.filter(prefix=network))
+            if results:
+                # Prefer the one matching our site; otherwise take the first
+                site_match = [p for p in results if getattr(getattr(p, "site", None), "id", None) == site.id]
+                prefix = site_match[0] if site_match else results[0]
+
         prefix_payload = {
             "prefix": network,
             "site"  : site.id,
@@ -555,6 +601,48 @@ class NetBoxSync:
         else:
             if not self.dry_run:
                 prefix.update(prefix_payload)
+                log.debug(f"    ~ Prefix updated: {network}")
+
+        # Create usable IP range for the prefix (first+1 to last-1)
+        # e.g. 172.17.1.0/24 -> 172.17.1.1 - 172.17.1.254
+        try:
+            net_obj   = ipaddress.ip_network(network, strict=False)
+            all_hosts = list(net_obj.hosts())  # excludes network + broadcast
+            if len(all_hosts) >= 2:
+                range_start = str(all_hosts[0])
+                range_end   = str(all_hosts[-1])
+                range_desc  = f"Usable range for {network}"
+
+                range_payload = {
+                    "start_address": range_start,
+                    "end_address"  : range_end,
+                    "site"         : site.id,
+                    "status"       : "active",
+                    "description"  : range_desc,
+                    "tags"         : self._tags_ids(),
+                }
+
+                existing_range = None
+                if not self.dry_run:
+                    results = list(self.nb.ipam.ip_ranges.filter(
+                        start_address=range_start,
+                        end_address=range_end,
+                    ))
+                    if results:
+                        existing_range = results[0]
+
+                if not existing_range:
+                    if self.dry_run:
+                        self._dry("CREATE", "IP Range", f"{range_start} - {range_end}")
+                    else:
+                        self.nb.ipam.ip_ranges.create(range_payload)
+                        log.info(f"    + IP range created: {range_start} - {range_end}")
+                else:
+                    if not self.dry_run:
+                        existing_range.update(range_payload)
+                        log.debug(f"    ~ IP range updated: {range_start} - {range_end}")
+        except Exception as e:
+            log.warning(f"    Could not create IP range for {network}: {e}")
 
         # IP address
         existing_ip = self.nb.ipam.ip_addresses.get(address=cidr) if not self.dry_run else None
@@ -595,12 +683,273 @@ class NetBoxSync:
 
         for iface in physical:
             ip_str   = iface.get("ip", "")
-            mask_str = iface.get("netmask", "")
+            mask_str = iface.get("netmask", "")  # may be empty on newer firmware
             name     = iface.get("name", "")
-            if not ip_str or not mask_str or ip_str == "0.0.0.0":
+            if not ip_str:
                 continue
             nb_iface = self.nb.dcim.interfaces.get(device_id=device_id, name=name) if not self.dry_run else None
             self._sync_ip(ip_str, mask_str, nb_iface, None, site)
+
+    # ------------------------------------------------------------------
+    # Step 6: VPN tunnels (IPsec + SSL-VPN)
+    # ------------------------------------------------------------------
+
+    def sync_vpn(self):
+        log.info("--- Step 6: VPN tunnels")
+        if not self._device and not self.dry_run:
+            log.warning("  Device not set, skipping.")
+            return
+
+        self._sync_ipsec_tunnels()
+        self._sync_ssl_vpn()
+
+    def _get_or_create_ike_proposal(self, name: str) -> object:
+        """Return an IKE proposal object, creating it if needed."""
+        prop = self.nb.vpn.ike_proposals.get(name=name)
+        if not prop:
+            if self.dry_run:
+                self._dry("CREATE", "IKE Proposal", name)
+                return None
+            prop = self.nb.vpn.ike_proposals.create({
+                "name"            : name,
+                "encryption_algorithm": "aes-256",
+                "authentication_algorithm": "sha256",
+                "group"           : "14",
+            })
+            log.info(f"  + IKE Proposal created: {name}")
+        return prop
+
+    def _get_or_create_ipsec_proposal(self, name: str) -> object:
+        """Return an IPsec proposal object, creating it if needed."""
+        prop = self.nb.vpn.ipsec_proposals.get(name=name)
+        if not prop:
+            if self.dry_run:
+                self._dry("CREATE", "IPsec Proposal", name)
+                return None
+            prop = self.nb.vpn.ipsec_proposals.create({
+                "name"                   : name,
+                "encryption_algorithm"   : "aes-256",
+                "authentication_algorithm": "sha256",
+            })
+            log.info(f"  + IPsec Proposal created: {name}")
+        return prop
+
+    def _sync_ipsec_tunnels(self):
+        """Sync IPsec phase1 tunnels into NetBox vpn.tunnels."""
+        tunnels = self.fgt.get_ipsec_tunnels()
+        log.info(f"  {len(tunnels)} IPsec tunnels found on FortiGate")
+
+        device_id = self._device.id if self._device else 0
+
+        for t in tunnels:
+            name       = t.get("name", "")
+            remote_gw  = t.get("remote-gw", "")
+            local_iface = t.get("interface", "")
+            ike_ver    = t.get("ike-version", "2")
+            authmethod = t.get("authmethod", "psk")
+            keylife    = t.get("keylife", 86400)
+
+            if not name:
+                continue
+
+            # Build comment with relevant info
+            comments = (
+                f"IKEv{ike_ver} | Auth: {authmethod} | "
+                f"Keylife: {keylife}s | Local interface: {local_iface}"
+            )
+
+            # Tunnel name for IKE/IPsec proposals (slugified)
+            proposal_name = f"FGT-IKEv{ike_ver}-{slugify(name)}"[:64]
+
+            tunnel_payload = {
+                "name"       : name,
+                "status"     : "active",
+                "encapsulation": "ipsec-tunnel",
+                "ipsec_profile": None,
+                "tunnel_id"  : None,
+                "tags"       : self._tags_ids(),
+                "comments"   : comments,
+            }
+
+            existing = self.nb.vpn.tunnels.get(name=name) if not self.dry_run else None
+
+            if not existing:
+                if self.dry_run:
+                    self._dry("CREATE", "IPsec Tunnel", name,
+                              {"remote_gw": remote_gw, "interface": local_iface})
+                    continue
+                tunnel = self.nb.vpn.tunnels.create(tunnel_payload)
+                log.info(f"  + IPsec tunnel created: {name}")
+            else:
+                if self.dry_run:
+                    self._dry("UPDATE", "IPsec Tunnel", name)
+                    continue
+                existing.update(tunnel_payload)
+                tunnel = existing
+                log.debug(f"  ~ IPsec tunnel updated: {name}")
+
+            # Termination A — local side (FortiGate device interface)
+            self._sync_tunnel_termination(
+                tunnel    = tunnel,
+                role      = "peer",
+                term_side = "a",
+                obj_type  = "dcim.interface",
+                device_id = device_id,
+                iface_name= local_iface,
+                ip_address= None,
+            )
+
+            # Termination B — remote peer
+            if remote_gw and remote_gw != "0.0.0.0":
+                self._sync_tunnel_termination(
+                    tunnel    = tunnel,
+                    role      = "peer",
+                    term_side = "b",
+                    obj_type  = None,
+                    device_id = None,
+                    iface_name= None,
+                    ip_address= remote_gw,
+                )
+
+    def _sync_tunnel_termination(self, tunnel, role: str, term_side: str,
+                                  obj_type, device_id, iface_name, ip_address):
+        """Create or skip a tunnel termination (side A or B)."""
+        if self.dry_run:
+            label = iface_name or ip_address or "?"
+            self._dry("CREATE", f"Tunnel Termination ({term_side})", label)
+            return
+
+        # Check if termination already exists for this tunnel+role+side
+        existing = list(self.nb.vpn.tunnel_terminations.filter(
+            tunnel_id=tunnel.id,
+        ))
+
+        # For simplicity: if any termination exists for this tunnel, skip
+        if existing:
+            log.debug(f"    Terminations already exist for tunnel '{tunnel.name}', skipping")
+            return
+
+        payload = {
+            "tunnel": tunnel.id,
+            "role"  : "peer",
+            "tags"  : self._tags_ids(),
+        }
+
+        # Side A: link to local device interface
+        if obj_type == "dcim.interface" and device_id and iface_name:
+            nb_iface = self.nb.dcim.interfaces.get(device_id=device_id, name=iface_name)
+            if nb_iface:
+                payload["termination_type"] = "dcim.interface"
+                payload["termination_id"]   = nb_iface.id
+
+        # Side B: store remote IP as outside IP
+        if ip_address:
+            payload["outside_ip_address"] = ip_address
+
+        try:
+            self.nb.vpn.tunnel_terminations.create(payload)
+            log.debug(f"    + Termination created for tunnel '{tunnel.name}'")
+        except Exception as e:
+            # Interface already used by another tunnel (NetBox limitation: 1 interface = 1 tunnel)
+            # Fall back: add local interface name to tunnel comments for documentation
+            if "already attached" in str(e) or "termination_type" in str(e):
+                if iface_name:
+                    try:
+                        existing_tunnel = self.nb.vpn.tunnels.get(name=tunnel.name)
+                        if existing_tunnel:
+                            old_comments = existing_tunnel.comments or ""
+                            note = f"Local interface: {iface_name} (shared WAN — NetBox only allows one tunnel per interface)"
+                            if note not in old_comments:
+                                new_comments = "\n".join(filter(None, [old_comments, note]))
+                                existing_tunnel.update({"comments": new_comments})
+                            log.debug(f"    ~ Added local interface to comments for '{tunnel.name}'")
+                    except Exception:
+                        pass
+            else:
+                log.warning(f"    Could not create termination for '{tunnel.name}': {e}")
+
+    def _sync_ssl_vpn(self):
+        """Sync SSL-VPN as a single tunnel + IP range in NetBox."""
+        settings = self.fgt.get_ssl_vpn_settings()
+        if not settings or settings.get("status") != "enable":
+            log.info("  SSL-VPN disabled or not found, skipping.")
+            return
+
+        log.info("  SSL-VPN enabled, syncing...")
+
+        tunnel_name = "SSL-VPN"
+        cert        = settings.get("servercert", "")
+        auth_timeout = settings.get("auth-timeout", 0)
+        comments    = f"Certificate: {cert} | Auth timeout: {auth_timeout}s"
+
+        tunnel_payload = {
+            "name"         : tunnel_name,
+            "status"       : "active",
+            "encapsulation": "openvpn",
+            "tags"         : self._tags_ids(),
+            "comments"     : comments,
+        }
+
+        existing = self.nb.vpn.tunnels.get(name=tunnel_name) if not self.dry_run else None
+        if not existing:
+            if self.dry_run:
+                self._dry("CREATE", "SSL-VPN Tunnel", tunnel_name)
+            else:
+                self.nb.vpn.tunnels.create(tunnel_payload)
+                log.info(f"  + SSL-VPN tunnel created: {tunnel_name}")
+        else:
+            if self.dry_run:
+                self._dry("UPDATE", "SSL-VPN Tunnel", tunnel_name)
+            else:
+                existing.update(tunnel_payload)
+                log.debug(f"  ~ SSL-VPN tunnel updated: {tunnel_name}")
+
+        # Sync SSL-VPN IP pools as NetBox IP ranges
+        pool_names = [p.get("name") for p in settings.get("tunnel-ip-pools", [])]
+        if not pool_names:
+            return
+
+        all_pools = self.fgt.get_ip_pools()
+        site = self._get_site()
+
+        for pool in all_pools:
+            if pool.get("name") not in pool_names:
+                continue
+
+            start_ip = pool.get("start-ip", pool.get("startip", ""))
+            end_ip   = pool.get("end-ip", pool.get("endip", ""))
+            if not start_ip or not end_ip or start_ip == "0.0.0.0":
+                continue
+
+            range_payload = {
+                "start_address": start_ip,
+                "end_address"  : end_ip,
+                "site"         : site.id,
+                "status"       : "active",
+                "description"  : f"SSL-VPN pool: {pool.get('name')}",
+                "tags"         : self._tags_ids(),
+            }
+
+            existing_range = self.nb.ipam.ip_ranges.filter(
+                start_address=start_ip,
+                end_address=end_ip,
+            )
+            existing_range = list(existing_range)
+
+            if not existing_range:
+                if self.dry_run:
+                    self._dry("CREATE", "IP Range (SSL-VPN pool)",
+                              f"{start_ip} - {end_ip}")
+                else:
+                    self.nb.ipam.ip_ranges.create(range_payload)
+                    log.info(f"  + SSL-VPN IP range created: {start_ip} - {end_ip}")
+            else:
+                if self.dry_run:
+                    self._dry("UPDATE", "IP Range (SSL-VPN pool)",
+                              f"{start_ip} - {end_ip}")
+                else:
+                    existing_range[0].update(range_payload)
+                    log.debug(f"  ~ SSL-VPN IP range updated: {start_ip} - {end_ip}")
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -620,6 +969,7 @@ class NetBoxSync:
             self.sync_physical_interfaces()
             self.sync_vlans()
             self.sync_physical_ips()
+            self.sync_vpn()
         except Exception as e:
             log.error(f"Fatal error: {e}")
             raise
